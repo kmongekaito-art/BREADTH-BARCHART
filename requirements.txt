@@ -6,3 +6,4 @@ requests
 numpy
 asyncio
 nest_asyncio
+playwright
