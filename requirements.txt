@@ -4,3 +4,5 @@ pandas
 plotly
 requests
 numpy
+asyncio
+nest_asyncio
