@@ -2,22 +2,45 @@ import os
 import sys
 import asyncio
 import subprocess
+import threading
 
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 import yfinance as yf
-import nest_asyncio
 from io import StringIO
 from playwright.async_api import async_playwright
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# Permitir asyncio en Streamlit
-nest_asyncio.apply()
-
 # Configuración de la página
 st.set_page_config(page_title="Market Breadth Analyzer (Barchart)", layout="wide")
+
+
+def run_coro_in_thread(coro, timeout=300):
+    """Ejecuta una corrutina en un hilo con su propio event loop.
+
+    Necesario porque el hilo de Streamlit ya puede tener un loop en marcha y
+    NO queremos tocar el loop del servidor (nest_asyncio lo rompe).
+    """
+    result = {}
+
+    def _runner():
+        try:
+            result["value"] = asyncio.run(coro)
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout)
+
+    if thread.is_alive():
+        raise TimeoutError(f"La descarga superó {timeout}s")
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
 
 # ==========================================
 # MAPEO DE TICKERS A SÍMBOLOS DE BARCHART
@@ -159,7 +182,7 @@ async def capturar_csv_barchart(simbolos):
 def get_barchart_data(ticker_selected):
     simbolos = BARCHART_SYMBOLS[ticker_selected]
     ensure_chromium_installed()
-    cierres_dict = asyncio.run(capturar_csv_barchart(simbolos))
+    cierres_dict = run_coro_in_thread(capturar_csv_barchart(simbolos), timeout=300)
 
     if cierres_dict:
         df = pd.concat(cierres_dict, axis=1)
@@ -366,3 +389,4 @@ with col_chart:
     )
     
     components.html(html_str + js_code, height=870)
+
