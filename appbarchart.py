@@ -1,8 +1,12 @@
+import os
+import sys
+import asyncio
+import subprocess
+
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 import yfinance as yf
-import asyncio
 import nest_asyncio
 from io import StringIO
 from playwright.async_api import async_playwright
@@ -36,73 +40,130 @@ with st.sidebar:
 # ==========================================
 # PASO 2: DESCARGA DE DATOS (Lógica original de Colab + Espera Segura)
 # ==========================================
+@st.cache_resource(show_spinner="🔧 Preparando Chromium (solo la primera vez, ~1 min)...")
+def ensure_chromium_installed():
+    """Streamlit Cloud no trae el binario de Chromium: lo instalamos una vez por proceso."""
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=900,
+        )
+        if proc.returncode != 0:
+            print(f"⚠️ playwright install falló: {proc.stderr[-2000:]}")
+        return proc.returncode == 0
+    except Exception as exc:
+        print(f"⚠️ No se pudo preparar Chromium: {exc}")
+        return False
+
+
+def _parsear_respuesta(raw_text):
+    """Convierte la respuesta CSV de Barchart en una Serie de cierres indexada por fecha."""
+    text = raw_text.strip()
+    if not text:
+        return None
+
+    primera = text.splitlines()[0].lower()
+    tiene_cabecera = "date" in primera and ("close" in primera or "symbol" in primera)
+
+    if tiene_cabecera:
+        df = pd.read_csv(StringIO(text))
+    else:
+        df = pd.read_csv(
+            StringIO(text),
+            header=None,
+            names=["Symbol", "Date", "Open", "High", "Low", "Close", "Volume"],
+        )
+
+    df.columns = [str(c).strip().strip('"') for c in df.columns]
+    cols = {c.lower(): c for c in df.columns}
+    date_col = cols.get("date") or cols.get("timestamp")
+    close_col = cols.get("close") or cols.get("last")
+    if not date_col or not close_col:
+        raise ValueError(f"Columnas no reconocidas: {list(df.columns)}")
+
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df.dropna(subset=[date_col]).sort_values(date_col).set_index(date_col)
+    return pd.to_numeric(df[close_col], errors="coerce")
+
+
 async def capturar_csv_barchart(simbolos):
-    """Función asíncrona robusta basada en tu lógica de Colab, con sincronización para evitar cierres prematuros"""
+    """Descarga los cierres de cada símbolo interceptando la respuesta 'queryeod' de Barchart."""
     resultados = {}
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
         )
-        
-        for simbolo in simbolos:
-            url = f"https://www.barchart.com/stocks/quotes/{simbolo}/interactive-chart"
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                viewport={"width": 1920, "height": 1080}, locale="en-US"
-            )
-            page = await context.new_page()
-            raw_text = [None]
-            
-            # Listener original que funciona en Colab
-            async def handle_response(response):
-                if "queryeod" in response.url and response.ok:
-                    raw_text[0] = await response.text()
-            
-            page.on("response", lambda resp: asyncio.ensure_future(handle_response(resp)))
-            await page.goto(url, wait_until="networkidle")
-            
-            # ESPERA SEGURA: Esperamos hasta que raw_text[0] tenga datos o pasen 20 segundos.
-            # Esto evita el 'TargetClosedError' porque NO cerramos el navegador hasta que la 
-            # tarea en segundo plano ha terminado de leer el texto exitosamente.
-            waited = 0
-            while raw_text[0] is None and waited < 20000:
-                await asyncio.sleep(0.5)
-                waited += 500
-                
-            if raw_text[0]:
+        try:
+            for simbolo in simbolos:
+                url = f"https://www.barchart.com/stocks/quotes/{simbolo}/interactive-chart"
+                context = await browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    viewport={"width": 1920, "height": 1080}, locale="en-US"
+                )
                 try:
-                    header = "Symbol,Date,Open,High,Low,Close,Volume"
-                    csv_completo = header + "\n" + raw_text[0].strip()
-                    df = pd.read_csv(StringIO(csv_completo))
-                    df['Date'] = pd.to_datetime(df['Date'])
-                    df = df.sort_values('Date').set_index('Date')
-                    resultados[simbolo] = df['Close']
-                except Exception as e:
-                    print(f"⚠️ Error procesando {simbolo}: {e}")
-            else:
-                print(f"⚠️ Timeout (20s) esperando respuesta de {simbolo}")
-                
-            # Cerramos el contexto de forma ordenada para este símbolo
-            await context.close()
-            
-        await browser.close()
+                    page = await context.new_page()
+                    loop = asyncio.get_running_loop()
+                    raw_future = loop.create_future()
+
+                    def _on_response(response):
+                        if raw_future.done():
+                            return
+                        if "queryeod" in response.url and response.ok:
+                            async def _store():
+                                try:
+                                    data = await response.text()
+                                    if not raw_future.done():
+                                        raw_future.set_result(data)
+                                except Exception as exc:
+                                    if not raw_future.done():
+                                        raw_future.set_exception(exc)
+                            asyncio.ensure_future(_store())
+
+                    page.on("response", _on_response)
+
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                    except Exception as exc:
+                        print(f"⚠️ Navegación {simbolo}: {exc}")
+
+                    if not raw_future.done():
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=8000)
+                        except Exception:
+                            pass
+
+                    try:
+                        raw_text = await asyncio.wait_for(raw_future, timeout=20)
+                    except Exception:
+                        raw_text = None
+                        print(f"⚠️ Timeout (20s) esperando respuesta de {simbolo}")
+
+                    if raw_text:
+                        try:
+                            serie = _parsear_respuesta(raw_text)
+                            if serie is not None and not serie.empty:
+                                resultados[simbolo] = serie
+                            else:
+                                print(f"⚠️ Respuesta vacía para {simbolo}")
+                        except Exception as exc:
+                            print(f"⚠️ Error procesando {simbolo}: {exc}")
+                finally:
+                    await context.close()
+        finally:
+            await browser.close()
     return resultados
+
 
 @st.cache_data(show_spinner="🕷️ Scraping Barchart (Primera vez puede tardar 10-20s)...", ttl=3600)
 def get_barchart_data(ticker_selected):
     simbolos = BARCHART_SYMBOLS[ticker_selected]
+    ensure_chromium_installed()
     cierres_dict = asyncio.run(capturar_csv_barchart(simbolos))
-    
-    # VERIFICACIÓN DE INTEGRIDAD
-    if len(cierres_dict) < len(simbolos):
-        missing = set(simbolos) - set(cierres_dict.keys())
-        st.error(f"⚠️ **Fallo en la descarga:** No se pudieron obtener los datos de {missing}. Por favor, recarga la página (F5).")
-        st.stop()
-        
+
     if cierres_dict:
         df = pd.concat(cierres_dict, axis=1)
-        df.columns = [col.replace('$', '') for col in df.columns]
+        df.columns = [str(col).replace('$', '') for col in df.columns]
         return df
     return None
 
@@ -133,7 +194,8 @@ def calculate_indicators(df_barchart, ticker_selected):
     
     roll_min = SPADVDEC['LINADN'].rolling(window=21).min()
     roll_max = SPADVDEC['LINADN'].rolling(window=21).max()
-    SPADVDEC['FORMULA'] = ((SPADVDEC['LINADN'] - roll_min) / (roll_max - roll_min)) * 100
+    rango = roll_max - roll_min
+    SPADVDEC['FORMULA'] = ((SPADVDEC['LINADN'] - roll_min) / rango.mask(rango == 0)) * 100
     SPADVDEC['ADn'] = SPADVDEC['FORMULA'].ewm(span=7).mean()
     
     SPADVDEC['MIMACD'] = SPADVDEC['LIN'].ewm(span=3).mean() - SPADVDEC['LIN'].ewm(span=8).mean()
@@ -156,17 +218,31 @@ def calculate_indicators(df_barchart, ticker_selected):
 # EJECUCIÓN DE CARGA DE DATOS
 # ==========================================
 # 1. Precio del ETF (yfinance)
-stock = yf.download(ticker, start='2020-01-01', interval='1d', progress=False, auto_adjust=True)
+try:
+    stock = yf.download(ticker, start='2020-01-01', interval='1d', progress=False, auto_adjust=True)
+except Exception as exc:
+    st.error(f"No se pudo descargar el precio de {ticker}: {exc}")
+    st.stop()
+
+if stock is None or stock.empty:
+    st.error(f"yfinance no devolvió datos para {ticker}. Recarga la página en unos segundos.")
+    st.stop()
+
 if isinstance(stock.columns, pd.MultiIndex):
     stock.columns = stock.columns.get_level_values(0)
 
 # 2. Datos de Barchart e Indicadores
 df_barchart = get_barchart_data(ticker)
-if df_barchart is not None:
-    SPADVDEC = calculate_indicators(df_barchart, ticker)
-else:
-    st.error("No se pudieron descargar los datos de Barchart.")
+if df_barchart is None:
+    st.error("No se pudieron descargar los datos de Barchart. Pulsa F5 o usa 'Clear cache' y recarga.")
     st.stop()
+
+faltan = [s.replace('$', '') for s in BARCHART_SYMBOLS[ticker] if s.replace('$', '') not in df_barchart.columns]
+if faltan:
+    st.error(f"⚠️ **Fallo en la descarga:** no se obtuvieron {', '.join(faltan)}. Recarga la página (F5) o usa 'Clear cache'.")
+    st.stop()
+
+SPADVDEC = calculate_indicators(df_barchart, ticker)
 
 # ==========================================
 # PASO 4: INTERFAZ (Layout y Controles)
